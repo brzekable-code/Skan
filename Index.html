@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Lokalizator produktów</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#172033;background:#f3f5f8}
+*{box-sizing:border-box}body{margin:0;padding:16px;max-width:680px;margin-inline:auto}
+h1{font-size:1.55rem;margin:8px 0 4px}.sub{color:#596579;margin:0 0 18px}
+.panel{background:#fff;border:1px solid #dfe4ec;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 2px 8px #14213d08}
+label{display:block;font-weight:650;margin-bottom:8px}
+input[type=file],input[type=text]{width:100%;font:inherit;padding:12px;border:1px solid #cbd3df;border-radius:10px;background:#fff}
+button{font:inherit;font-weight:700;border:0;border-radius:11px;padding:13px 15px;background:#2457d6;color:white;width:100%;margin-top:10px}
+button.secondary{background:#e8edf7;color:#1d2b46}button:disabled{opacity:.45}
+.small{font-size:.9rem;color:#596579;line-height:1.45}.status{margin-top:10px;font-size:.93rem}
+#reader{width:100%;overflow:hidden;border-radius:12px;margin-top:12px}
+.result{background:#edf8f0;border:1px solid #b8e3c4;border-radius:14px;padding:16px;margin-top:12px}
+.result.notfound{background:#fff3ee;border-color:#f0c6b7}
+.location{font-size:2.5rem;font-weight:850;line-height:1.15;overflow-wrap:anywhere}
+.code{font-family:ui-monospace,monospace;font-size:1.05rem;overflow-wrap:anywhere}
+.hidden{display:none}.row{display:flex;gap:8px;align-items:center}.row button{flex:1}
+</style>
+</head>
+<body>
+<h1>📦 Lokalizator produktów</h1>
+<p class="sub">Wybierz plik Excel, zeskanuj QR lub EAN i sprawdź lokalizację.</p>
+
+<section class="panel">
+  <label for="excel">1. Wybierz plik Excel (.xlsx, .xls lub .csv)</label>
+  <input id="excel" type="file" accept=".xlsx,.xls,.xlsm,.csv">
+  <div id="fileStatus" class="status">Nie wczytano jeszcze pliku.</div>
+  <p class="small">Arkusz powinien mieć lokalizację w kolumnie A i kod produktu w kolumnie B. Nagłówki są opcjonalne.</p>
+</section>
+
+<section class="panel">
+  <label>2. Skanowanie kodu</label>
+  <button id="startScan" disabled>Uruchom aparat i skanuj</button>
+  <button id="stopScan" class="secondary hidden">Zatrzymaj aparat</button>
+  <div id="reader" class="hidden"></div>
+  <p class="small">Jeśli aparat nie działa, wpisz lub wklej kod ręcznie poniżej.</p>
+  <label for="manualCode">Kod produktu</label>
+  <div class="row">
+    <input id="manualCode" type="text" inputmode="text" placeholder="np. 2033442">
+    <button id="searchBtn" style="width:auto;white-space:nowrap;margin-top:0" disabled>Szukaj</button>
+  </div>
+</section>
+
+<section id="result" class="panel hidden" aria-live="polite"></section>
+<p class="small">Wymagany jest internet. Skanowanie aparatem działa po otwarciu strony przez HTTPS. Plik Excel jest odczytywany w przeglądarce na telefonie.</p>
+
+<script>
+let products = new Map();
+let scanner = null;
+let scanning = false;
+
+const excelInput = document.getElementById('excel');
+const fileStatus = document.getElementById('fileStatus');
+const startBtn = document.getElementById('startScan');
+const stopBtn = document.getElementById('stopScan');
+const searchBtn = document.getElementById('searchBtn');
+const manualCode = document.getElementById('manualCode');
+const result = document.getElementById('result');
+const reader = document.getElementById('reader');
+
+function norm(v) {
+  return String(v ?? '').trim().replace(/\.0$/, '');
+}
+function showResult(code, location) {
+  result.classList.remove('hidden','notfound');
+  if (location === undefined) {
+    result.classList.add('notfound');
+    result.innerHTML = `<strong>Nie znaleziono produktu</strong><p>Kod: <span class="code"></span></p><p class="small">Sprawdź, czy kod z etykiety odpowiada wartości w kolumnie B.</p>`;
+    result.querySelector('.code').textContent = code;
+  } else {
+    result.innerHTML = `<div class="small">LOKALIZACJA PRODUKTU</div><div class="location"></div><p>Kod produktu: <span class="code"></span></p>`;
+    result.querySelector('.location').textContent = location || '(pusta lokalizacja)';
+    result.querySelector('.code').textContent = code;
+    if (navigator.vibrate) navigator.vibrate(100);
+  }
+}
+function searchCode(raw) {
+  const code = norm(raw);
+  if (!code) return;
+  manualCode.value = code;
+  // First try the entire QR/EAN value, then a standalone digit sequence
+  // (useful if a QR contains a short label around the product code).
+  let location = products.get(code);
+  if (location === undefined) {
+    const digitRuns = code.match(/\d{4,}/g) || [];
+    for (const candidate of digitRuns) {
+      if (products.has(candidate)) { location = products.get(candidate); break; }
+    }
+  }
+  showResult(code, location);
+}
+excelInput.addEventListener('change', async () => {
+  const file = excelInput.files && excelInput.files[0];
+  if (!file) return;
+  try {
+    const data = await file.arrayBuffer();
+    const workbook = XLSX.read(data, {type:'array', raw:true});
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, {header:1, defval:'', raw:false});
+    const next = new Map();
+    let skipped = 0;
+    for (const row of rows) {
+      const loc = norm(row[0]);
+      const code = norm(row[1]);
+      if (!loc && !code) continue;
+      // Skip a common header row, but otherwise keep all rows.
+      if (/lokalizacj|miejsce/i.test(loc) && /kod|produkt/i.test(code)) continue;
+      if (code) next.set(code, loc);
+      else skipped++;
+    }
+    products = next;
+    fileStatus.textContent = `Wczytano: ${file.name}. Liczba kodów: ${products.size}.`;
+    startBtn.disabled = products.size === 0;
+    searchBtn.disabled = products.size === 0;
+    result.classList.add('hidden');
+  } catch (e) {
+    fileStatus.textContent = 'Nie udało się odczytać pliku. Spróbuj zapisać go jako .xlsx lub .csv.';
+    products = new Map();
+    startBtn.disabled = true;
+    searchBtn.disabled = true;
+  }
+});
+searchBtn.addEventListener('click', () => searchCode(manualCode.value));
+manualCode.addEventListener('keydown', e => { if (e.key === 'Enter') searchCode(manualCode.value); });
+
+startBtn.addEventListener('click', async () => {
+  if (!window.Html5Qrcode) {
+    alert('Nie udało się załadować skanera. Sprawdź połączenie z internetem i odśwież stronę.');
+    return;
+  }
+  reader.classList.remove('hidden');
+  startBtn.classList.add('hidden');
+  stopBtn.classList.remove('hidden');
+  scanner = new Html5Qrcode('reader');
+  try {
+    scanning = true;
+    await scanner.start(
+      {facingMode:'environment'},
+      {fps:12, qrbox:(vw,vh)=>({width:Math.min(vw*0.82,320),height:Math.min(vh*0.42,220)}),
+       formatsToSupport:[
+        Html5QrcodeSupportedFormats.QR_CODE,
+        Html5QrcodeSupportedFormats.EAN_13,
+        Html5QrcodeSupportedFormats.EAN_8,
+        Html5QrcodeSupportedFormats.CODE_128,
+        Html5QrcodeSupportedFormats.CODE_39,
+        Html5QrcodeSupportedFormats.UPC_A,
+        Html5QrcodeSupportedFormats.UPC_E
+       ]},
+      decodedText => {
+        if (!scanning) return;
+        searchCode(decodedText);
+        stopScanner();
+      },
+      () => {}
+    );
+  } catch (e) {
+    scanning = false;
+    reader.classList.add('hidden');
+    startBtn.classList.remove('hidden');
+    stopBtn.classList.add('hidden');
+    alert('Nie można uruchomić aparatu. Sprawdź zgodę na użycie kamery i otwórz aplikację przez HTTPS.');
+  }
+});
+async function stopScanner() {
+  scanning = false;
+  if (scanner) {
+    try { if (scanner.isScanning) await scanner.stop(); } catch(e) {}
+    try { await scanner.clear(); } catch(e) {}
+    scanner = null;
+  }
+  reader.classList.add('hidden');
+  startBtn.classList.remove('hidden');
+  stopBtn.classList.add('hidden');
+}
+stopBtn.addEventListener('click', stopScanner);
+</script>
+</body>
+</html>
